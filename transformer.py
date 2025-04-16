@@ -208,22 +208,33 @@ print(f"Input dimension: {input_dim}")
 
 # Enhanced GazeDataset with NaN handling
 class GazeDataset(Dataset):
-    def __init__(self, segments):
+    def __init__(self, segments, exclude_non_reading_for_training=False):
         # Updated label mapping with a third category:
         self.label_map = {"reading": 0, "scanning": 1, "non reading": 2}
-        self.segments = segments
-        self.file_paths = [seg["file_path"] for seg in segments]
+        self.exclude_non_reading_for_training = exclude_non_reading_for_training
+        
+        # Filter segments if excluding non-reading for training
+        if exclude_non_reading_for_training:
+            self.segments = [seg for seg in segments if self._get_label_str(seg) != "non reading"]
+            print(f"Excluded {len(segments) - len(self.segments)} 'non reading' samples for training")
+        else:
+            self.segments = segments
+            
+        self.file_paths = [seg["file_path"] for seg in self.segments]
         
         # Count labels for reporting
         self.label_counts = {"reading": 0, "scanning": 0, "non reading": 0}
-        for seg in segments:
+        for seg in self.segments:
             label = self._get_label_str(seg)
             if label in self.label_counts:
                 self.label_counts[label] += 1
         
         print("Dataset label distribution:")
         for label, count in self.label_counts.items():
-            print(f"  {label}: {count} ({count/len(segments)*100:.1f}%)")
+            if count > 0:
+                print(f"  {label}: {count} ({count/len(self.segments)*100:.1f}%)")
+            else:
+                print(f"  {label}: No samples")
     
     def _get_label_str(self, segment):
         """Extract and normalize label string."""
@@ -443,26 +454,31 @@ class PositionalEncoding(nn.Module):
 
 # Create the dataset and DataLoader with all segments
 print("Creating dataset...")
-dataset = GazeDataset(all_segments)
+# Create training dataset without non-reading samples
+train_dataset = GazeDataset(all_segments, exclude_non_reading_for_training=True)
+# Create test dataset also without non-reading samples
+test_dataset = GazeDataset(all_segments, exclude_non_reading_for_training=True)
+
 batch_size = args.batch_size
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_gaze)
-test_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_gaze)
-print(f"Dataset size: {len(dataset)} samples")
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_gaze)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_gaze)
+print(f"Training dataset size: {len(train_dataset)} samples")
+print(f"Testing dataset size: {len(test_dataset)} samples")
 
 # Instantiate the model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = GazeTransformer(
     input_dim=input_dim,
     model_dim=args.model_dim,
-    num_classes=3,
+    num_classes=3,  # Keep model output as 3 classes for compatibility
     num_layers=args.num_layers,
     nhead=args.nhead
 ).to(device)
 
 # Define loss and optimizer with enhanced class weights to handle imbalance
-class_counts = np.array([dataset.label_counts["reading"], 
-                        dataset.label_counts["scanning"], 
-                        dataset.label_counts["non reading"]])
+class_counts = np.array([train_dataset.label_counts["reading"], 
+                        train_dataset.label_counts["scanning"], 
+                        train_dataset.label_counts["non reading"]])
 total_samples = sum(class_counts)
 num_classes = len(class_counts)
 
@@ -538,7 +554,7 @@ for epoch in range(1, num_epochs + 1):
     epoch_total = 0
     epoch_loss = 0.0
     
-    for i, (gaze_batch, mask_batch, label_batch, _) in enumerate(dataloader):
+    for i, (gaze_batch, mask_batch, label_batch, _) in enumerate(train_dataloader):
         gaze_batch = gaze_batch.to(device)
         mask_batch = mask_batch.to(device)
         label_batch = label_batch.to(device)
@@ -571,6 +587,7 @@ print(f"Training completed in {train_time:.2f} seconds")
 # Evaluate the model
 print("Generating predictions and evaluating model...")
 idx_to_label = {0: "reading", 1: "scanning", 2: "non reading"}
+active_classes = ["reading", "scanning"]  # Only consider these classes for evaluation
 model.eval()
 
 all_results = []
@@ -578,8 +595,8 @@ total_correct = 0
 total_samples = 0
 all_true_labels = []
 all_predictions = []
-class_correct = {"reading": 0, "scanning": 0, "non reading": 0}
-class_total = {"reading": 0, "scanning": 0, "non reading": 0}
+class_correct = {"reading": 0, "scanning": 0}
+class_total = {"reading": 0, "scanning": 0}
 
 with torch.no_grad():
     for gaze_batch, mask_batch, label_batch, idx_batch in test_dataloader:
@@ -604,13 +621,14 @@ with torch.no_grad():
         for i in range(len(label_batch)):
             true_label = idx_to_label[label_batch[i].item()]
             pred_label = idx_to_label[predictions[i].item()]
-            class_total[true_label] += 1
-            if correct[i]:
-                class_correct[true_label] += 1
+            if true_label in active_classes:
+                class_total[true_label] += 1
+                if correct[i]:
+                    class_correct[true_label] += 1
         
         # Save individual results
         for i, idx in enumerate(idx_batch):
-            file_path = dataset.file_paths[idx]
+            file_path = test_dataset.file_paths[idx]
             pred_label = idx_to_label[predictions[i].item()]
             true_label = idx_to_label[label_batch[i].item()]
             
@@ -628,7 +646,7 @@ print(f"Overall accuracy: {final_accuracy:.2f}%")
 
 # Calculate class-wise accuracy
 print("\nAccuracy by class:")
-for label in ["reading", "scanning", "non reading"]:
+for label in active_classes:
     if class_total[label] > 0:
         class_accuracy = 100 * class_correct[label] / class_total[label]
         print(f"  {label}: {class_accuracy:.2f}% ({class_correct[label]}/{class_total[label]})")
@@ -656,30 +674,29 @@ for i, class_name in idx_to_label.items():
 
 # Create confusion matrix
 confusion = {
-    "reading": {"reading": 0, "scanning": 0, "non reading": 0},
-    "scanning": {"reading": 0, "scanning": 0, "non reading": 0},
-    "non reading": {"reading": 0, "scanning": 0, "non reading": 0}
+    "reading": {"reading": 0, "scanning": 0},
+    "scanning": {"reading": 0, "scanning": 0}
 }
 
 for result in all_results:
     actual = result["actual"]
     pred = result["prediction"]
-    confusion[actual][pred] += 1
+    # Only consider reading and scanning classes
+    if actual in active_classes and pred in active_classes:
+        confusion[actual][pred] += 1
 
 print("\nConfusion Matrix:")
 print(f"                   Predicted")
-print(f"                 | Reading | Scanning | Non-reading")
-print(f"-------------------|---------|----------|------------")
-for actual in ["reading", "scanning", "non reading"]:
+print(f"                 | Reading | Scanning")
+print(f"-------------------|---------|----------")
+for actual in active_classes:
     r = confusion[actual]["reading"]
     s = confusion[actual]["scanning"]
-    n = confusion[actual]["non reading"]
-    total = r + s + n
+    total = r + s
     r_percent = r / total * 100 if total > 0 else 0
     s_percent = s / total * 100 if total > 0 else 0
-    n_percent = n / total * 100 if total > 0 else 0
     
-    print(f"Actual {actual:12s} | {r:3d} ({r_percent:4.1f}%) | {s:3d} ({s_percent:4.1f}%) | {n:3d} ({n_percent:4.1f}%)")
+    print(f"Actual {actual:12s} | {r:3d} ({r_percent:4.1f}%) | {s:3d} ({s_percent:4.1f}%)")
 
 # Create results summary
 config = {
@@ -705,9 +722,8 @@ results_summary = {
     "config": config,
     "num_samples": total_samples,
     "class_distribution": {
-        "reading": dataset.label_counts["reading"],
-        "scanning": dataset.label_counts["scanning"],
-        "non_reading": dataset.label_counts["non reading"]
+        "reading": train_dataset.label_counts["reading"],
+        "scanning": train_dataset.label_counts["scanning"]
     },
     "accuracy": float(f"{final_accuracy:.2f}"),
     "f1_macro": float(f"{f1_macro:.2f}"),
@@ -715,12 +731,14 @@ results_summary = {
     "precision_macro": float(f"{precision_macro:.2f}"),
     "recall_macro": float(f"{recall_macro:.2f}"),
     "f1_per_class": {
-        idx_to_label[i]: float(f"{score:.2f}") for i, score in enumerate(f1_per_class) if i < len(f1_per_class)
+        idx_to_label[i]: float(f"{score:.2f}") 
+        for i, score in enumerate(f1_per_class) 
+        if i < len(f1_per_class) and idx_to_label[i] in active_classes
     },
     "class_accuracy": {
         label: float(f"{100 * class_correct[label] / class_total[label]:.2f}") 
         if class_total[label] > 0 else 0
-        for label in ["reading", "scanning", "non reading"]
+        for label in active_classes
     },
     "confusion_matrix": confusion,
     "training_time_seconds": train_time,
