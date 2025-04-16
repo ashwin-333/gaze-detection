@@ -11,6 +11,7 @@ import time
 from sklearn.metrics import f1_score, precision_score, recall_score
 import argparse
 import math
+import torch.nn.functional as F
 
 # Setting local paths
 FT_dir = Path("./S1-31/FT/")
@@ -30,6 +31,11 @@ parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
 parser.add_argument('--model_dim', type=int, default=64, help='Transformer model dimension')
 parser.add_argument('--num_layers', type=int, default=2, help='Number of transformer layers')
 parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
+parser.add_argument('--weight_method', type=str, default='inverse', choices=['inverse', 'balanced', 'effective_samples', 'none'], 
+                   help='Method for computing class weights')
+parser.add_argument('--focal_loss', action='store_true', help='Use focal loss instead of cross entropy')
+parser.add_argument('--focal_gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
+parser.add_argument('--weight_factor', type=float, default=1.0, help='Factor to adjust weight intensity (higher = stronger weighting)')
 
 # Default to using both eyes if no specific option is selected
 args = parser.parse_args()
@@ -453,12 +459,72 @@ model = GazeTransformer(
     nhead=args.nhead
 ).to(device)
 
-# Define loss and optimizer with class weights to handle imbalance
+# Define loss and optimizer with enhanced class weights to handle imbalance
 class_counts = np.array([dataset.label_counts["reading"], 
                         dataset.label_counts["scanning"], 
                         dataset.label_counts["non reading"]])
-class_weights = torch.tensor(1.0 / (class_counts + 1e-8), dtype=torch.float32).to(device)
-criterion = nn.CrossEntropyLoss(weight=class_weights)
+total_samples = sum(class_counts)
+num_classes = len(class_counts)
+
+# Calculate class weights based on selected method
+if args.weight_method == 'none':
+    class_weights = torch.ones(num_classes, dtype=torch.float32)
+elif args.weight_method == 'inverse':
+    # Inverse frequency weighting (more weight to rare classes)
+    class_weights = torch.tensor(1.0 / (class_counts + 1e-8), dtype=torch.float32)
+    # Apply weighting factor
+    class_weights = torch.pow(class_weights, args.weight_factor)
+elif args.weight_method == 'balanced':
+    # Balanced weighting (inverse of normalized frequency)
+    class_weights = torch.tensor(total_samples / (class_counts * num_classes + 1e-8), dtype=torch.float32)
+    # Apply weighting factor
+    class_weights = torch.pow(class_weights, args.weight_factor)
+elif args.weight_method == 'effective_samples':
+    # Effective number of samples (reduces overfitting to minority classes)
+    beta = 0.9999
+    effective_num = 1.0 - np.power(beta, class_counts)
+    weights = (1.0 - beta) / np.array(effective_num)
+    weights = weights / np.sum(weights) * num_classes
+    class_weights = torch.tensor(weights, dtype=torch.float32)
+    # Apply weighting factor
+    class_weights = torch.pow(class_weights, args.weight_factor)
+
+# Normalize weights to sum to num_classes
+class_weights = class_weights * (num_classes / torch.sum(class_weights))
+class_weights = class_weights.to(device)
+
+print(f"Class weights ({args.weight_method}):")
+for i, (name, weight) in enumerate(zip(["reading", "scanning", "non reading"], class_weights)):
+    print(f"  {name}: {weight:.4f}")
+
+# Define focal loss if requested
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, input, target):
+        ce_loss = F.cross_entropy(input, target, weight=self.weight, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# Choose loss function based on arguments
+if args.focal_loss:
+    print(f"Using Focal Loss (gamma={args.focal_gamma}) with {args.weight_method} weighting")
+    criterion = FocalLoss(weight=class_weights, gamma=args.focal_gamma)
+else:
+    print(f"Using Cross Entropy Loss with {args.weight_method} weighting")
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
 # Train the model
@@ -628,7 +694,11 @@ config = {
     "nhead": args.nhead,
     "epochs": num_epochs,
     "batch_size": batch_size,
-    "learning_rate": args.lr
+    "learning_rate": args.lr,
+    "weight_method": args.weight_method,
+    "focal_loss": args.focal_loss,
+    "focal_gamma": args.focal_gamma,
+    "weight_factor": args.weight_factor
 }
 
 results_summary = {
