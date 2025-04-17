@@ -4,6 +4,8 @@ A deep learning project for classifying eye gaze patterns using transformer-base
 
 ## File Structure
 
+```text
+.
 ├── experiments
 │   ├── onegaze.py
 │   ├── multigaze.py
